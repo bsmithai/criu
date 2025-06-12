@@ -15,6 +15,8 @@
 #include <elf.h>
 #include <linux/fiemap.h>
 #include <linux/fs.h>
+#include <linux/memfd.h>
+#include <time.h>
 
 #include "tty.h"
 #include "stats.h"
@@ -36,6 +38,11 @@
 #define BUILD_ID_MAP_SIZE 1048576
 #define ST_UNIT		  512
 #define EXTENT_MAX_COUNT  512
+
+/* memfd remap configuration */
+#define MEMFD_REMAP_THRESHOLD (16 * 1024 * 1024)
+
+static u32 memfd_remap_counter = 0x90000000;
 
 #include "cr_options.h"
 #include "imgset.h"
@@ -64,6 +71,12 @@
 
 int setfsuid(uid_t fsuid);
 int setfsgid(gid_t fsuid);
+
+static bool should_use_memfd_remap(const struct fd_parms *parms, const char *path);
+static int dump_memfd_remap(char *path, int len, const struct fd_parms *parms, 
+							int lfd, u32 id, struct ns_id *nsid);
+static int collect_remap_memfd(struct reg_file_info *rfi, RemapFilePathEntry *rpe);
+static int prepare_memfd_remap(struct reg_file_info *rfi, RemapFilePathEntry *rpe);
 
 /*
  * Ghost files are those not visible from the FS. Dumping them is
@@ -761,6 +774,10 @@ static int collect_one_remap(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 		if (collect_remap_dead_process(ri->rfi, rpe) < 0)
 			return -1;
 		break;
+	case REMAP_TYPE__REMAP_MEMFD:
+		if (collect_remap_memfd(ri->rfi, ri->rpe))
+			return -1;
+		break;
 	default:
 		break;
 	}
@@ -788,6 +805,9 @@ static int prepare_one_remap(struct remap_info *ri)
 	case REMAP_TYPE__PROCFS:
 		/* handled earlier by collect_remap_dead_process */
 		ret = 0;
+		break;
+	case REMAP_TYPE__REMAP_MEMFD:
+		ret = prepare_memfd_remap(rfi, rpe);
 		break;
 	default:
 		pr_err("unknown remap type %u\n", rpe->remap_type);
@@ -1117,6 +1137,8 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
 	FownEntry fwn = FOWN_ENTRY__INIT;
 	int mntns_root;
 	const struct stat *ost = &parms->stat;
+	char random_suffix[16];
+	int fd;
 
 	if (!opts.link_remap_ok) {
 		pr_err("Can't create link remap for %s. "
@@ -1149,10 +1171,31 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
 	rfe.fown = &fwn;
 	rfe.name = link_name + 1;
 
-	/* Any 'unique' name works here actually. Remap works by reg-file ids. */
-	snprintf(tmp + 1, sizeof(link_name) - (size_t)(tmp - link_name) - 1, "link_remap.%d", rfe.id);
-
 	mntns_root = mntns_get_root_fd(nsid);
+
+	fd = open("/dev/urandom", O_RDONLY);
+	if (fd >= 0) {
+		unsigned char rand_bytes[8];
+		if (read(fd, rand_bytes, sizeof(rand_bytes)) == sizeof(rand_bytes)) {
+			snprintf(random_suffix, sizeof(random_suffix), "%02x%02x%02x%02x",
+				rand_bytes[0], rand_bytes[1], rand_bytes[2], rand_bytes[3]);
+		} else {
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			snprintf(random_suffix, sizeof(random_suffix), "%lx", 
+				(unsigned long)(ts.tv_sec ^ ts.tv_nsec));
+		}
+		close(fd);
+	} else {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		snprintf(random_suffix, sizeof(random_suffix), "%lx", 
+			(unsigned long)(ts.tv_sec ^ ts.tv_nsec));
+	}
+
+    // Create file with random suffix after fd number link_remap.fd_id.random_suffix
+	snprintf(tmp + 1, sizeof(link_name) - (size_t)(tmp - link_name) - 1, 
+		"link_remap.%d.%s", rfe.id, random_suffix);
 
 	while (linkat_hard(lfd, "", mntns_root, link_name, ost->st_uid, ost->st_gid, AT_EMPTY_PATH) < 0) {
 		if (errno != ENOENT) {
@@ -1160,7 +1203,6 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
 			return -1;
 		}
 
-		/* Use grand parent, if parent directory does not exist. */
 		if (trim_last_parent(link_name) < 0) {
 			pr_err("trim failed: @%s@\n", link_name);
 			check_overlayfs_fallback(path, parms, fallback);
@@ -1412,6 +1454,12 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 
 		if (errno == ENOENT) {
 			link_strip_deleted(link);
+			
+			/* Try memfd for tmpfs files and small files */
+			if (should_use_memfd_remap(parms, rpath + 1)) {
+				return dump_memfd_remap(rpath + 1, plen - 1, parms, lfd, id, nsid);
+			}
+			
 			ret = dump_linked_remap(rpath + 1, plen - 1, parms, lfd, id, nsid, &fallback);
 			if (ret < 0 && fallback) {
 				/* fallback is true only if following conditions are true:
@@ -1668,8 +1716,8 @@ static int get_build_id(const int fd, const struct stat *fd_status, unsigned cha
 
 	/*
 	 * The first 4 bytes contain a magic number identifying the file as an
-	 * ELF file. They should contain the characters ‘\x7f’, ‘E’, ‘L’, and
-	 * ‘F’, respectively. These characters are together defined as ELFMAG.
+	 * ELF file. They should contain the characters 'E', 'L', 'F', and
+	 * 'F', respectively. These characters are together defined as ELFMAG.
 	 */
 	if (memcmp(start_addr, ELFMAG, SELFMAG))
 		goto out;
@@ -2631,4 +2679,148 @@ int collect_remaps_and_regfiles(void)
 		return -1;
 
 	return 0;
+}
+
+/*
+ * Check if file should use memfd remap (tmpfs)  
+ */
+static bool should_use_memfd_remap(const struct fd_parms *parms, const char *path)
+{
+	const struct stat *st = &parms->stat;
+	
+	if (!S_ISREG(st->st_mode))
+		return false;
+		
+	if (st->st_size > MEMFD_REMAP_THRESHOLD)
+		return false;
+	
+	/* Always use memfd for tmpfs files /dev/shm) */
+	if (parms->fs_type == TMPFS_MAGIC) {
+		pr_info("Using memfd for tmpfs file %s\n", path);
+		return true;
+	}
+	
+	if (st->st_size <= (1024 * 1024))
+		return true;
+	
+	return false;
+}
+
+/*
+ * Dump memfd content to image file similar to ghost files
+ */
+static int dump_memfd_remap(char *path, int len, const struct fd_parms *parms, 
+							int lfd, u32 id, struct ns_id *nsid)
+{
+	off_t file_size = parms->stat.st_size;
+	RemapFilePathEntry rpe = REMAP_FILE_PATH_ENTRY__INIT;
+	struct cr_img *img;
+	int orig_fd;
+	u32 remap_id = ++memfd_remap_counter;
+	
+	pr_info("dump_memfd_remap: Starting for %s (size: %lld)\n", path, (long long)file_size);
+	
+	/* open original file */
+	orig_fd = open_proc(PROC_SELF, "fd/%d", lfd);
+	if (orig_fd < 0) {
+		pr_perror("Can't open original file: %s", path);
+		return -1;
+	}
+	
+	img = open_image(CR_FD_GHOST_FILE, O_DUMP, remap_id);
+	if (!img) {
+		pr_err("Failed to open image for memfd remap\n");
+		close(orig_fd);
+		return -1;
+	}
+	
+	if (copy_file(orig_fd, img_raw_fd(img), file_size) < 0) {
+		pr_err("Failed to copy file content to image\n");
+		close_image(img);
+		close(orig_fd);
+		return -1;
+	}
+	
+	close_image(img);
+	close(orig_fd);
+	
+    /* remap entry */
+	rpe.orig_id = id;
+	rpe.remap_id = remap_id;
+	rpe.has_remap_type = true;
+	rpe.remap_type = REMAP_TYPE__REMAP_MEMFD;
+	
+	if (pb_write_one(img_from_set(glob_imgset, CR_FD_REMAP_FPATH), &rpe, PB_REMAP_FPATH) < 0) {
+		pr_err("Failed to write memfd remap entry\n");
+		return -1;
+	}
+	
+	pr_info("Created memfd remap: %s -> memfd_%u (%lld bytes)\n", 
+			path, remap_id, (long long)file_size);
+	
+	return 0;
+}
+
+static int collect_remap_memfd(struct reg_file_info *rfi, RemapFilePathEntry *rpe)
+{
+	/* For memfd remaps, we don't need a remap structure at all.
+	 * The file will be restored directly to its original location
+	 * during the prepare phase, no remap needed. Just calling it
+     * remap because I don't know how to name it better. Help
+	 */
+	rfi->remap = NULL;
+	
+	pr_info("Collected memfd remap: orig_id=%u, remap_id=%u\n", 
+			rpe->orig_id, rpe->remap_id);
+	
+	return 0;
+}
+
+static int prepare_memfd_remap(struct reg_file_info *rfi, RemapFilePathEntry *rpe)
+{
+	struct cr_img *img;
+	int orig_fd = -1;
+	int ret = -1;
+	int mntns_root;
+	
+    /* get saved content */
+	img = open_image(CR_FD_GHOST_FILE, O_RSTR, rpe->remap_id);
+	if (!img) {
+		pr_err("Failed to open memfd content image for id %u\n", rpe->remap_id);
+		return -1;
+	}
+	
+	/* mount namespace root for creating the file */
+	mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
+	if (mntns_root < 0) {
+		pr_err("Failed to get mount root for memfd remap\n");
+		goto close_img;
+	}
+	
+	/* this is where we create original file at original location */
+	orig_fd = openat(mntns_root, rfi->path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	if (orig_fd < 0) {
+		pr_perror("Failed to create restored file %s", rfi->path);
+		goto close_img;
+	}
+	
+	if (copy_file(img_raw_fd(img), orig_fd, 0) < 0) {
+		pr_err("Failed to restore file content for %s\n", rfi->path);
+		goto close_orig;
+	}
+	
+	close(orig_fd);
+	close_image(img);
+	
+	pr_info("Restored memfd content to original path: %s\n", rfi->path);
+	
+	return 0;
+	
+close_orig:
+	close(orig_fd);
+    /* cleanup of partially created file */
+	unlinkat(mntns_root, rfi->path, 0);
+close_img:
+	close_image(img);
+	return ret;
 }
